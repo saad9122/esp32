@@ -12,12 +12,11 @@
 #define RX_PIN 17
 
 // WiFi Credentials
-const char* ssid = "Infinix";
+const char* ssid = "HANJEE FIBER - SAAD";
 const char* password = "lahore1222";
 
-// Local Server URLs
-const char* sensorDataURL = "https://iot-rust-gamma.vercel.app/api/sensors";
-const char* thresholdURL = "https://iot-rust-gamma.vercel.app/api/threshold";
+// Local Server Base URL
+const char* baseURL = "http://192.168.100.36:5000/readings/";
 
 // Initialize sensors
 OneWire ourWire(DS18B20_PIN);
@@ -33,37 +32,13 @@ float safeValue(float value) {
   return isnan(value) ? 0.0 : value;
 }
 
-// Function to fetch the threshold value from the server
-void fetchThresholdValue() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi Disconnected. Cannot fetch threshold.");
-    return;
-  }
-
-  HTTPClient http;
-  http.begin(thresholdURL);
-
-  int httpResponseCode = http.GET();
-
-  if (httpResponseCode > 0) {
-    String response = http.getString();
-    Serial.print("Threshold Response: ");
-    Serial.println(response);
-
-    // Parse the response and update the threshold value
-    float newThreshold = response.toFloat();
-    if (newThreshold > 0) {  // Add validation if necessary
-      temperatureThreshold = newThreshold;
-      Serial.printf("Updated Temperature Threshold: %.2f\n", temperatureThreshold);
-    } else {
-      Serial.println("Invalid threshold value received.");
-    }
-  } else {
-    Serial.print("Error fetching threshold. HTTP Response Code: ");
-    Serial.println(httpResponseCode);
-  }
-
-  http.end();
+String getMACAddress() {
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(macStr);
 }
 
 void sendDataToServer(float tempC, float voltage, float current, float power) {
@@ -79,6 +54,8 @@ void sendDataToServer(float tempC, float voltage, float current, float power) {
   Serial.printf("Voltage: %.2f V\n", voltage);
   Serial.printf("Current: %.2f A\n", current);
   Serial.printf("Power: %.2f W\n", power);
+  Serial.printf("Relay State: %s\n", relayState ? "ON" : "OFF");
+  Serial.printf("Temperature Threshold: %.2f°C\n", temperatureThreshold);
 
   if (WiFi.status() != WL_CONNECTED) {
     WiFi.begin(ssid, password);
@@ -89,18 +66,19 @@ void sendDataToServer(float tempC, float voltage, float current, float power) {
     Serial.println("\nReconnected to WiFi");
   }
 
-
   HTTPClient http;
-  http.begin(sensorDataURL);
+
+  // Construct the URL dynamically with the MAC address
+  String url = String(baseURL) + getMACAddress();
+  http.begin(url.c_str());
   http.addHeader("Content-Type", "application/json");
 
-  // Create JSON payload with careful formatting
-  char jsonPayload[250];
+  // Create JSON payload
+  char jsonPayload[350];
   snprintf(jsonPayload, sizeof(jsonPayload),
-           "{\"temperature\":%.2f,\"voltage\":%.2f,\"current\":%.2f,\"power\":%.2f,\"relayState\":%s,\"temperatureThreshold\":%.2f}",
+           "{\"temperature\":%.2f,\"voltage\":%.2f,\"current\":%.2f,\"power\":{\"Power\":%.2f},\"relayState\":%s,\"temperatureThreshold\":%.2f}",
            tempC, voltage, current, power,
-           relayState ? "true" : "false",
-           temperatureThreshold);
+           relayState ? "true" : "false", temperatureThreshold);
 
   Serial.print("JSON Payload: ");
   Serial.println(jsonPayload);
@@ -165,9 +143,6 @@ void loop() {
 
   // Send data to server
   sendDataToServer(tempC, voltage, current, power);
-
-  // Fetch updated threshold value
-  fetchThresholdValue();
 
   delay(5000);  // Execute loop every 5 seconds
 }
