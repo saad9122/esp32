@@ -1,21 +1,19 @@
 #include <WiFi.h>
+#include <WiFiManager.h>
 #include <PubSubClient.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <PZEM004Tv30.h>
 #include <ArduinoJson.h>
+#include <EEPROM.h>
 
 // Pin Definitions
 #define DS18B20_PIN 15
 #define RELAY_PIN 5
-// #define RELAY_PIN 14
 #define LED_PIN 2
 #define TX_PIN 16
 #define RX_PIN 17
-
-// Default WiFi Credentials
-char ssid[32] = "HANJEE FIBER - SAAD";
-char password[32] = "lahore1222";
+#define CONFIG_RESET_PIN 4  // Pin to reset WiFi settings
 
 // MQTT Broker Settings
 const char* mqtt_server = "192.168.100.36";  // Your server IP
@@ -33,6 +31,7 @@ PZEM004Tv30 pzem1(Serial2, RX_PIN, TX_PIN);
 // MQTT Client
 WiFiClient espClient;
 PubSubClient client(espClient);
+WiFiManager wifiManager;
 
 // Settings Variables
 float temperatureThreshold = 25.0;
@@ -49,6 +48,16 @@ float safeValue(float value) {
 
 String getMACAddress() {
   if (deviceId.length() == 0) {
+    // Ensure WiFi is started before fetching MAC address
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.begin();  // Start WiFi if not already connected
+      unsigned long startAttemptTime = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
+        delay(100);
+      }
+    }
+
+    // Fetch the MAC address
     uint8_t mac[6];
     WiFi.macAddress(mac);
     char macStr[18];
@@ -59,6 +68,16 @@ String getMACAddress() {
   return deviceId;
 }
 
+void saveConfigCallback() {
+  Serial.println("Should save config");
+}
+
+void configModeCallback(WiFiManager *myWiFiManager) {
+  Serial.println("Entered config mode");
+  Serial.println(WiFi.softAPIP());
+  Serial.println(myWiFiManager->getConfigPortalSSID());
+}
+
 void reconnectMQTT() {
   while (!client.connected()) {
     Serial.println("Attempting MQTT connection...");
@@ -66,15 +85,11 @@ void reconnectMQTT() {
 
     if (client.connect(clientId.c_str())) {
       Serial.println("Connected to MQTT broker");
-
-      // Subscribe to settings topic
       client.subscribe(MQTT_TOPIC_SETTINGS);
-
-      // Publish initial state
       publishSensorData(sensor.getTempCByIndex(0),
-                        pzem1.voltage(),
-                        pzem1.current(),
-                        pzem1.power());
+                       pzem1.voltage(),
+                       pzem1.current(),
+                       pzem1.power());
     } else {
       Serial.print("Failed, rc=");
       Serial.print(client.state());
@@ -95,8 +110,6 @@ void callback(char* topic, byte* payload, unsigned int length) {
   if (!error) {
     const char* targetDeviceId = doc["deviceId"];
     if (targetDeviceId && String(targetDeviceId) == getMACAddress()) {
-      bool wifiCredentialsUpdated = false;
-
       if (strcmp(topic, MQTT_TOPIC_SETTINGS) == 0) {
         if (doc.containsKey("threshold")) {
           temperatureThreshold = doc["threshold"];
@@ -107,52 +120,10 @@ void callback(char* topic, byte* payload, unsigned int length) {
           reverseRelay = doc["reverseRelay"];
           Serial.printf("Updated reverseRelay: %s\n", reverseRelay ? "true" : "false");
         }
-
-        if (doc.containsKey("ssid")) {
-          String newSsid = doc["ssid"];
-          if (newSsid != ssid) {  // Check if SSID is actually changed
-            strlcpy(ssid, newSsid.c_str(), sizeof(ssid));
-            Serial.printf("Updated WiFi SSID: %s\n", ssid);
-            wifiCredentialsUpdated = true;
-          }
-        }
-
-        if (doc.containsKey("password")) {
-          String newPassword = doc["password"];
-          if (newPassword != password) {  // Check if password is actually changed
-            strlcpy(password, newPassword.c_str(), sizeof(password));
-            Serial.println("Updated WiFi Password");
-            wifiCredentialsUpdated = true;
-          }
-        }
-
-        // Reconnect to WiFi if credentials were updated
-        if (wifiCredentialsUpdated) {
-          Serial.println("WiFi credentials updated. Reconnecting to WiFi...");
-          WiFi.disconnect();
-          WiFi.begin(ssid, password);
-
-          unsigned long startAttemptTime = millis();
-
-          // Wait for connection (with a timeout of 10 seconds)
-          while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
-            delay(500);
-            Serial.print(".");
-          }
-
-          if (WiFi.status() == WL_CONNECTED) {
-            Serial.println("\nWiFi reconnected successfully");
-            Serial.print("New IP address: ");
-            Serial.println(WiFi.localIP());
-          } else {
-            Serial.println("\nFailed to reconnect to WiFi");
-          }
-        }
       }
     }
   }
 }
-
 
 void updateRelayState(float temperature) {
   bool shouldRelayBeOn = reverseRelay ? (temperature < temperatureThreshold) : (temperature >= temperatureThreshold);
@@ -170,20 +141,13 @@ void publishSensorData(float tempC, float voltage, float current, float power) {
 
   StaticJsonDocument<350> doc;
 
-  // Add device identification
   doc["deviceId"] = getMACAddress();
-
-  // Sensor readings
   doc["temperature"] = safeValue(tempC);
   doc["voltage"] = safeValue(voltage);
   doc["current"] = safeValue(current);
   doc["power"] = safeValue(power);
-
-  // Device state
   doc["relayState"] = relayState;
   doc["temperatureThreshold"] = temperatureThreshold;
-
-  // Add timestamp
   doc["timestamp"] = millis();
 
   char jsonBuffer[350];
@@ -201,6 +165,7 @@ void setup() {
   // Initialize pins
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
+  pinMode(CONFIG_RESET_PIN, INPUT_PULLUP);
 
   // Initialize Serial2 for PZEM
   Serial2.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
@@ -208,14 +173,34 @@ void setup() {
   // Initialize temperature sensor
   sensor.begin();
 
-  // Connect to WiFi
-  Serial.println("Connecting to WiFi...");
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  // Set WiFiManager callbacks
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
+  wifiManager.setAPCallback(configModeCallback);
+
+  // Create unique device name for AP mode
+  String apName = "ESP32_" + getMACAddress();
+  
+  // Configure timeout
+  wifiManager.setConfigPortalTimeout(180); // 3 minutes timeout
+  
+  // Enable Debug mode
+  wifiManager.setDebugOutput(true);
+
+  // Check if need to reset settings
+  if (digitalRead(CONFIG_RESET_PIN) == LOW) {
+    Serial.println("Reset button pressed, resetting WiFi settings");
+    wifiManager.resetSettings();
+    ESP.restart();
   }
-  Serial.println("\nConnected to WiFi");
+
+  // Try to connect to saved WiFi or start config portal
+  if (!wifiManager.autoConnect(apName.c_str())) {
+    Serial.println("Failed to connect and hit timeout");
+    delay(3000);
+    ESP.restart();
+  }
+
+  Serial.println("Connected to WiFi");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 
@@ -225,6 +210,12 @@ void setup() {
 }
 
 void loop() {
+  // Check if WiFi is connected
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi connection lost. Attempting to reconnect...");
+    wifiManager.autoConnect();
+  }
+
   if (!client.connected()) {
     reconnectMQTT();
   }
